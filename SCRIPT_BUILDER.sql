@@ -13,6 +13,10 @@ package            script_builder as
   
   procedure print(msg varchar2);
   procedure printClob(msg clob);
+  
+  
+  /*Instalation Functions*/
+  procedure print_instalation_functions;
 end;
 /
 create or replace
@@ -26,6 +30,7 @@ PACKAGE BODY SCRIPT_BUILDER AS
     print('Schema: '||gv_schema);
     
     dbms_lob.createtemporary(gv_script,true);
+    print_instalation_functions;
     
     for tbl in cr_tables loop      
       print('Table: '||tbl.table_name);
@@ -86,7 +91,7 @@ PACKAGE BODY SCRIPT_BUILDER AS
                     case
                       when v_col.data_precision is null then v_col.data_length||''
                       when (v_col.data_precision > 0 and v_col.data_scale = 0) then (v_col.data_length||','||v_col.data_precision)||''
-                      else (v_col.data_length||','||v_col.data_precision||','||v_col.data_scale)||''
+                      else (v_col.data_length||','||v_col.data_precision||'')||''--||','||v_col.data_scale)||''
                     end
                     ||')'
                   when v_col.data_type = 'DATE' then
@@ -94,12 +99,7 @@ PACKAGE BODY SCRIPT_BUILDER AS
                   when v_col.data_type = 'VARCHAR2' or v_col.data_type = 'CHAR' then
                     '('||v_col.data_length||')'
                  end
-                ||
-                case v_col.nullable
-                  when 'Y' then ''
-                  when 'N' then ' not null'
-                end
-                ||
+                 ||
                 case when v_col.data_default is not null then
                   case
                     when v_col.data_type = 'NUMBER' or v_col.data_Type = 'DATE' then ' default '||replace(trim(v_col.data_default),chr(10),'')
@@ -107,6 +107,11 @@ PACKAGE BODY SCRIPT_BUILDER AS
                     
                   end
                 end
+                ||
+                case v_col.nullable
+                  when 'Y' then ''
+                  when 'N' then ' not null'
+                end                
                 ||')'';
         end if;
       end;
@@ -208,8 +213,11 @@ PACKAGE BODY SCRIPT_BUILDER AS
           
         case v_cons_row.constraint_type
           when 'C' then -- Check Constraint
-            DBMS_LOB.APPEND(v_text,'check ('||v_cons_row.SEARCH_CONDITION||')');
-            null;
+            case when instr(v_cons_row.SEARCH_CONDITION,'NOT NULL') = 0 then
+              dbms_lob.append(v_text,'check ('||v_cons_row.search_condition||')');
+            else
+              v_text := 'alter table '||v_owner||'.'||v_table_name||' alter column ('|| v_cons_col_row.column_name||' not null';
+            end case;            
           when 'R' then -- Referential Constraint (FK)
             if length(v_fk_columns_txt) = 0 then
               --Get the referenced columns
@@ -266,6 +274,123 @@ PACKAGE BODY SCRIPT_BUILDER AS
     if gv_do_print = 1 then
       DBMS_XSLPROCESSOR.CLOB2FILE(msg, upper('CHI_INT_DIR'), 'CLOB_EXPORT'||'.sql');
     end if;
+  end;
+
+
+  procedure print_instalation_functions as
+    v_functions varchar2(4500) := '
+      create or replace
+      procedure         rename_constraint(
+        in_owner in varchar2,
+        in_table in varchar2,
+        in_column in varchar2,
+        in_constraint_type in varchar2,
+        in_constraint_name in varchar2  
+      )
+      as
+        v_old_constraint_name varchar2(200);
+        constraintChar varchar2(5000) := in_constraint_type;
+      begin
+          select
+            case when upper(in_constraint_type) in (''PRIMARY'',''PRIMARY_KEY'') then
+              ''P''
+            when upper(in_constraint_type) in (''FOREIGN'',''FOREIGN KEY'') then
+              ''R''
+            when upper(in_constraint_type) in (''UNIQUE'') then
+              ''U''
+            when upper(in_constraint_type) in (''CHECK'') then
+              ''C'' 
+            else
+              in_constraint_type
+            end into constraintChar
+          from dual;
+      
+          select ac.constraint_name into v_old_constraint_name
+          from
+          all_constraints ac 
+          left join 
+          all_cons_columns acc on ac.owner = acc.owner and ac.constraint_name = acc.constraint_name 
+          where upper(ac.owner) = upper(in_owner) and upper(ac.table_name) = upper(in_table) and upper(acc.column_name) = upper(in_column) and upper(ac.constraint_type) = upper(constraintChar);
+          
+          execute immediate
+          ''alter table ''||upper(in_owner)||''.''||upper(in_table)||'' rename constraint ''||upper(v_old_constraint_name)||'' to ''||upper(in_constraint_name);
+      end;
+      /
+      create or replace
+      function has_constraint_by_name(ownerName in varchar2, tableName in varchar2, constraintName in varchar2) return integer
+        as
+          returnRslt integer := 0;
+        begin
+          select count(1) into returnRslt from all_constraints where owner = ownerName and table_name = upper(tableName) and constraint_name = upper(constraintName);
+          return returnRslt;
+      end;
+      /
+      create or replace
+        function has_constraint_by_type(ownerName in varchar2, tableName in varchar2,columnName in varchar2, constraintType in varchar2) return integer   
+        as        
+          returnRslt integer := 0;
+          constraintChar varchar2(5000);
+        begin
+          select
+            case when upper(constraintType) in (''PRIMARY'',''PRIMARY_KEY'') then
+              ''P''
+            when upper(constraintType) in (''FOREIGN'',''FOREIGN KEY'') then
+              ''R''
+            when upper(constraintType) in (''UNIQUE'') then
+              ''U''
+            when upper(constraintType) in (''CHECK'') then
+              ''C''
+            else
+              constraintType  
+            end into constraintChar
+          from dual;  
+          select count(1) into returnRslt   
+          from
+            all_constraints ac 
+            left join 
+            all_cons_columns acc on ac.owner = acc.owner and ac.constraint_name = acc.constraint_name 
+            where upper(ac.owner) = upper(ownerName) and 
+            upper(ac.table_name) = upper(tableName) and 
+            upper(acc.column_name) = upper(columnName) and 
+            upper(ac.constraint_type) = upper(constraintChar);          
+          return returnRslt;
+      end;
+      /
+      create or replace
+      function has_object(
+          ownerName in varchar2,
+          objectName in varchar2) return integer
+          as
+            returnRslt integer := 0;
+          begin
+            select count(1) into returnRslt from all_objects where upper(owner) = upper(ownerName) and upper(object_name) = upper(objectName);
+            return returnRslt;
+      end;
+      /
+      create or replace
+      function has_user(
+        user_name in varchar2
+      ) return integer
+      as
+        returnVal integer := 0;
+      begin
+        select count(1) into returnVal from all_users where upper(username) = upper(user_name);
+        return returnVal;
+      end;
+      /
+      create or replace
+      function OBJEXISTS(ownerName in varchar2, tableName in varchar2, columnName in varchar2) return number AUTHID CURRENT_USER
+      is
+        v_count number;
+      begin
+        select count(*) into v_count from all_tab_cols where owner = upper(ownerName) and table_name = upper(tableName) and column_name = upper(columnName);
+        
+        return v_count;
+      end;
+      /
+    ';      
+  begin
+    DBMS_LOB.APPEND(GV_SCRIPT,V_FUNCTIONS);
   end;
 
 END SCRIPT_BUILDER;
